@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Run one isolated Teams for Linux instance per client (tenant) and manage them from one tray icon.
+
+Clients live in ~/.config/teams-clients/clients.json (order = number). Each client
+gets its own profile dir, window class and tray item; the Teams Clients plasmoid hides
+those tray items and shows every client behind a single icon using `status`/`click`.
+
+  teams-client setup                 install launchers, shortcuts, autostart, tray config
+  teams-client status                JSON for the tray plasmoid
+  teams-client focus N|name          start or bring that client to the front
+  teams-client cycle                 bring Teams up / switch to the next client
+  teams-client start-all             start every client minimized (autostart)
+  teams-client quit N|name           quit that client
+  teams-client link URL              open a Teams link in the last-used client
+  teams-client click N|name ID       trigger an item of the client's own tray menu
+  teams-client list | add NAME | rename N NAME | remove N
+  teams-client add-gui | remove-gui N    the same, with KDE dialogs (used by the tray menu)
+"""
+import json, os, re, shutil, subprocess, sys, time
+import warnings
+from gi.repository import Gio, GLib
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+HOME = os.path.expanduser("~")
+SELF = os.path.realpath(__file__)
+CONF = f"{HOME}/.config/teams-clients/clients.json"
+ICONS = f"{HOME}/.local/share/icons/teams-clients"
+APPS = f"{HOME}/.local/share/applications"
+AUTOSTART = f"{HOME}/.config/autostart"
+STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.last"
+BIN = shutil.which("teams-for-linux") or "/usr/bin/teams-for-linux"
+PLASMOID = "io.github.jamesstuder.teamsclients"
+DBUS_IFACE = "io.github.jamesstuder.TeamsClient"
+HIDDEN_LABELS = {"Quit (Clear Storage)"}  # one click logs the client out; too easy to hit by accident
+COLORS = ["#d9534f", "#2e86de", "#27ae60", "#f39c12", "#8e44ad", "#16a085", "#c0392b", "#34495e", "#e67e22"]
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+
+def dbus(dest, path, iface, meth, args=None, timeout=1500):
+    return bus.call_sync(dest, path, iface, meth, args, None, 0, timeout, None).unpack()
+
+
+def base_icon():
+    for size in ("512x512", "256x256", "128x128"):
+        for root in ("/usr/share/icons/hicolor", f"{HOME}/.local/share/icons/hicolor"):
+            p = f"{root}/{size}/apps/teams-for-linux.png"
+            if os.path.exists(p):
+                return p
+
+
+# ---- client list -----------------------------------------------------------
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)["clients"]
+    except FileNotFoundError:
+        return []
+
+
+def save(clients):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump({"clients": clients}, f, indent=2)
+    for i, c in enumerate(clients):
+        write_desktop(i, c)
+    sync_tray(clients)
+
+
+def pick(clients, key):
+    if key.isdigit() and 1 <= int(key) <= len(clients):
+        return int(key) - 1, clients[int(key) - 1]
+    for i, c in enumerate(clients):
+        if key.lower() in (c["slug"], c["name"].lower()):
+            return i, c
+    sys.exit(f"no client '{key}'")
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "client"
+
+
+def profile_dir(c):
+    return f"{HOME}/.config/teams-client-{c['slug']}"
+
+
+def wm_class(c):
+    return f"teams-{c['slug']}"
+
+
+def sni_id(c):
+    return f"{wm_class(c)}_status_icon_1"  # Electron names its tray item <class>_status_icon_1
+
+
+def icon_path(c):
+    return f"{ICONS}/{c['slug']}.png"
+
+
+def make_icon(i, c):
+    """Teams icon with the client's initials on a coloured badge (needs ImageMagick)."""
+    base, magick = base_icon(), shutil.which("magick")
+    if not base or not magick:
+        return
+    os.makedirs(ICONS, exist_ok=True)
+    initials = "".join(w[0] for w in re.split(r"[\s\-_]+", c["name"]) if w)[:3].upper()
+    pts = {1: 100, 2: 85, 3: 65}[max(1, len(initials))]
+    subprocess.run([magick, base, "-resize", "256x256",
+                    "(", "-size", "256x256", "xc:none", "-fill", COLORS[i % len(COLORS)],
+                    "-draw", "roundrectangle 96,136 255,255 28,28",
+                    "-fill", "white", "-font", "DejaVu-Sans-Bold", "-pointsize", str(pts),
+                    "-gravity", "southeast", "-annotate", "+14+22", initials, ")",
+                    "-composite", icon_path(c)], check=False)
+
+
+def write_desktop(i, c):
+    make_icon(i, c)
+    os.makedirs(APPS, exist_ok=True)
+    icon = icon_path(c) if os.path.exists(icon_path(c)) else "teams-for-linux"
+    with open(f"{APPS}/teams-{c['slug']}.desktop", "w") as f:
+        f.write(f"""[Desktop Entry]
+Type=Application
+Name=Teams - {c['name']}
+Comment=Microsoft Teams for {c['name']} (isolated profile)
+Exec={SELF} focus {c['slug']}
+Icon={icon}
+StartupWMClass={wm_class(c)}
+Categories=Network;InstantMessaging;
+""")
+
+
+def sync_tray(clients):
+    """Hide every client's own tray icon and make sure the Teams Clients plasmoid is enabled."""
+    ids = json.dumps([sni_id(c) for c in clients])
+    script = f"""
+const ids = {ids};
+function list(v) {{ return (Array.isArray(v) ? v : String(v || '').split(',')).filter(x => x); }}
+for (const p of panels()) for (const w of p.widgets()) if (w.type == 'org.kde.plasma.systemtray') {{
+    w.currentConfigGroup = ['General'];
+    w.writeConfig('hiddenItems', list(w.readConfig('hiddenItems')).filter(x => !/^teams-.*_status_icon_1$/.test(x)).concat(ids));
+    for (const k of ['extraItems', 'knownItems']) {{
+        const l = list(w.readConfig(k));
+        if (l.indexOf('{PLASMOID}') < 0) {{ l.push('{PLASMOID}'); w.writeConfig(k, l); }}
+    }}
+    w.reloadConfig();
+}}"""
+    try:
+        dbus("org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell", "evaluateScript",
+             GLib.Variant("(s)", (script,)), 5000)
+    except GLib.Error as e:
+        print(f"could not update the system tray: {e.message}", file=sys.stderr)
+
+
+# ---- one-time setup ----------------------------------------------------------
+
+def desktop_file(name, body):
+    with open(name, "w") as f:
+        f.write("[Desktop Entry]\nType=Application\n" + body)
+
+
+def register_shortcut(component, friendly, key):
+    """Global launch shortcut; a kglobalaccel component named *.desktop runs that desktop file."""
+    meta, shift = 0x10000000, 0x02000000
+    aid = [component, "_launch", friendly, "Launch"]
+    k = ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel")
+    dbus(*k, "doRegister", GLib.Variant("(as)", (aid,)))
+    dbus(*k, "setForeignShortcutKeys", GLib.Variant("(asa(ai))", (aid, [([meta | shift | key, 0, 0, 0],)])))
+
+
+def setup(shortcuts=True):
+    os.makedirs(APPS, exist_ok=True)
+    os.makedirs(AUTOSTART, exist_ok=True)
+    desktop_file(f"{APPS}/teams-cycle.desktop", f"""Name=Microsoft Teams (all clients)
+Comment=Bring Teams up, or switch to the next client
+Exec={SELF} cycle
+Icon=teams-for-linux
+Categories=Network;InstantMessaging;
+""")
+    for n in range(1, 10):
+        desktop_file(f"{APPS}/teams-slot-{n}.desktop",
+                     f"Name=Teams client {n}\nExec={SELF} focus {n}\nIcon=teams-for-linux\nNoDisplay=true\n")
+    # Shadow the stock launcher so it can't start an unmanaged default profile, and route
+    # msteams: links to the last-used client.
+    desktop_file(f"{APPS}/teams-for-linux.desktop", f"""Name=Microsoft Teams (all clients)
+Comment=Opens Teams links in the last-used client
+Exec={SELF} link %u
+Icon=teams-for-linux
+NoDisplay=true
+MimeType=x-scheme-handler/msteams;
+""")
+    subprocess.run(["update-desktop-database", APPS], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["xdg-mime", "default", "teams-for-linux.desktop", "x-scheme-handler/msteams"],
+                   check=False, stderr=subprocess.DEVNULL)
+    desktop_file(f"{AUTOSTART}/teams-clients.desktop", f"""Name=Teams clients
+Comment=Start every Teams client minimized so notifications arrive
+Exec={SELF} start-all
+Icon=teams-for-linux
+X-KDE-autostart-phase=2
+""")
+    if shortcuts:
+        try:
+            register_shortcut("teams-cycle.desktop", "Microsoft Teams (all clients)", ord("T"))
+            for n in range(1, 10):
+                register_shortcut(f"teams-slot-{n}.desktop", f"Teams client {n}", ord(str(n)))
+        except GLib.Error as e:
+            print(f"could not register shortcuts: {e.message}", file=sys.stderr)
+    save(load())
+
+
+# ---- process / tray state --------------------------------------------------
+
+def main_pids():
+    """user-data-dir -> pid of the Teams main process."""
+    out = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            # Chromium rewrites its process title, so args may be one space-joined string.
+            cmd = open(f"/proc/{p}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if not re.match(r"\S*teams-for-linux ", cmd) or " --type=" in cmd:
+            continue
+        m = re.search(r" --user-data-dir=(\S+)", cmd)
+        if m:
+            out[m.group(1)] = int(p)
+    return out
+
+
+def sni_items():
+    """StatusNotifierItem Id -> (service, path, props)."""
+    out = {}
+    try:
+        items = dbus("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.freedesktop.DBus.Properties", "Get",
+                     GLib.Variant("(ss)", ("org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems")))[0]
+    except GLib.Error:
+        return out
+    for it in items:
+        svc, _, path = it.partition("/")
+        if "StatusNotifierItem-" not in svc:  # Electron registers under a well-known name like this
+            continue
+        try:
+            props = dbus(svc, "/" + path, "org.freedesktop.DBus.Properties", "GetAll",
+                         GLib.Variant("(s)", ("org.kde.StatusNotifierItem",)), 500)[0]
+        except GLib.Error:
+            continue
+        out[props.get("Id", "")] = (svc, "/" + path, props)
+    return out
+
+
+def menu_tree(svc, path):
+    try:
+        layout = dbus(svc, path, "com.canonical.dbusmenu", "GetLayout", GLib.Variant("(iias)", (0, -1, [])))[1]
+    except GLib.Error:
+        return []
+
+    def conv(node):
+        nid, p, kids = node
+        if p.get("visible", True) is False or p.get("label") in HIDDEN_LABELS:
+            return None
+        if p.get("type") == "separator":
+            return {"type": "separator"}
+        return {"id": nid, "label": p.get("label", "").replace("_", ""), "enabled": p.get("enabled", True),
+                "checkable": p.get("toggle-type") in ("checkmark", "radio"), "checked": p.get("toggle-state") == 1,
+                "children": [x for x in map(conv, kids) if x]}
+
+    return [x for x in map(conv, layout[2]) if x]
+
+
+def state():
+    clients, pids, snis = load(), main_pids(), sni_items()
+    out = []
+    for i, c in enumerate(clients):
+        sni = snis.get(sni_id(c))
+        unread = 0
+        if sni:
+            tip = sni[2].get("ToolTip")
+            m = re.search(r"\((\d+)\)\s*$", tip[2] if tip else "")
+            unread = int(m.group(1)) if m else 0
+        out.append({"n": i + 1, "slug": c["slug"], "name": c["name"], "icon": icon_path(c),
+                    "pid": pids.get(profile_dir(c)), "sni": sni, "unread": unread})
+    return out
+
+
+# ---- windows (via a one-shot KWin script that reports back over D-Bus) -----
+
+def kwin_run(js, name):
+    path = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/{name}.js"
+    with open(path, "w") as f:
+        f.write(js)
+    k = ("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
+    try:
+        dbus(*k, "unloadScript", GLib.Variant("(s)", (name,)))
+        sid = dbus(*k, "loadScript", GLib.Variant("(ss)", (path, name)))[0]
+        dbus("org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script", "run")
+    finally:
+        dbus(*k, "unloadScript", GLib.Variant("(s)", (name,)))
+
+
+def windows():
+    """Normal windows as [{pid, active, minimized}] (hidden-to-tray windows are absent)."""
+    result = []
+    name = f"{DBUS_IFACE}.p{os.getpid()}"
+    loop = GLib.MainLoop()
+    node = Gio.DBusNodeInfo.new_for_xml(
+        f"<node><interface name='{DBUS_IFACE}'><method name='Report'><arg type='s' direction='in'/></method></interface></node>")
+
+    def on_call(conn, sender, path, iface, meth, params, inv):
+        result.extend(json.loads(params.unpack()[0]))
+        inv.return_value(None)
+        loop.quit()
+
+    reg = bus.register_object("/", node.interfaces[0], on_call, None, None)
+    own = Gio.bus_own_name_on_connection(bus, name, Gio.BusNameOwnerFlags.NONE, None, None)
+    kwin_run(f"""
+const out = workspace.windowList().filter(w => w.normalWindow).map(w => (
+    {{pid: w.pid, active: w === workspace.activeWindow, minimized: w.minimized}}));
+callDBus("{name}", "/", "{DBUS_IFACE}", "Report", JSON.stringify(out));
+""", "teams-client-query")
+    GLib.timeout_add(1500, loop.quit)
+    loop.run()
+    Gio.bus_unown_name(own)
+    bus.unregister_object(reg)
+    return result
+
+
+def activate_pid(pid):
+    kwin_run(f"""
+for (const w of workspace.windowList()) {{
+    if (w.pid === {pid} && w.normalWindow) {{ w.minimized = false; workspace.activeWindow = w; break; }}
+}}""", "teams-client-focus")
+
+
+def click(sni, item_id):
+    svc, path, props = sni
+    dbus(svc, props.get("Menu", "/MenuBar"), "com.canonical.dbusmenu", "Event",
+         GLib.Variant("(isvu)", (int(item_id), "clicked", GLib.Variant("i", 0), int(time.time()))))
+
+
+def menu_id(sni, label):
+    for it in menu_tree(sni[0], sni[2].get("Menu", "/MenuBar")):
+        if it.get("label") == label:
+            return it["id"]
+
+
+def launch(c, minimized=False, extra=()):
+    args = [BIN, "--gtk-version=3", f"--class={wm_class(c)}", f"--user-data-dir={profile_dir(c)}",
+            f"--appTitle=Teams - {c['name']}"]
+    if os.path.exists(icon_path(c)):
+        args.append(f"--appIcon={icon_path(c)}")
+    if minimized:
+        args.append("--minimized")
+    args += list(extra)
+    os.makedirs(profile_dir(c), exist_ok=True)
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def focus(st):
+    with open(STATE, "w") as f:
+        f.write(st["slug"])
+    if not st["pid"]:
+        launch(load()[st["n"] - 1])
+        return
+    if not any(w["pid"] == st["pid"] for w in windows()) and st["sni"]:
+        # Hidden to tray: ask the client itself to show its window, then wait for it to map.
+        oid = menu_id(st["sni"], "Open")
+        if oid:
+            click(st["sni"], oid)
+        for _ in range(15):
+            time.sleep(0.1)
+            if any(w["pid"] == st["pid"] for w in windows()):
+                break
+    activate_pid(st["pid"])
+
+
+def cycle():
+    sts = state()
+    if not sts:
+        sys.exit("no clients configured")
+    for s in sts:  # also (re)start anything that isn't running
+        if not s["pid"]:
+            launch(load()[s["n"] - 1], minimized=True)
+    wins = windows()
+    active = next((w["pid"] for w in wins if w["active"]), None)
+    cur = next((i for i, s in enumerate(sts) if s["pid"] and s["pid"] == active), None)
+    if cur is not None:
+        target = sts[(cur + 1) % len(sts)]
+    else:
+        # Not in Teams: go to a client with unread messages, else the last one used.
+        try:
+            last = open(STATE).read().strip()
+        except OSError:
+            last = ""
+        target = (next((s for s in sts if s["unread"]), None)
+                  or next((s for s in sts if s["slug"] == last), sts[0]))
+    focus(target)
+
+
+def stop(st):
+    if st["pid"]:
+        os.kill(st["pid"], 15)
+        for _ in range(50):
+            if not os.path.exists(f"/proc/{st['pid']}"):
+                break
+            time.sleep(0.1)
+
+
+def remove(clients, i, delete_data=False):
+    c = clients.pop(i)
+    for f in (f"{APPS}/teams-{c['slug']}.desktop", icon_path(c)):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+    save(clients)
+    if delete_data:
+        shutil.rmtree(profile_dir(c), ignore_errors=True)
+    return c
+
+
+def main():
+    cmd, args = (sys.argv[1] if len(sys.argv) > 1 else "cycle"), sys.argv[2:]
+    clients = load()
+    if cmd == "setup":
+        setup(shortcuts="--no-shortcuts" not in args)
+    elif cmd == "status":
+        out = []
+        for s in state():
+            sni = s.pop("sni")
+            s["running"] = bool(s.pop("pid"))
+            s["menu"] = menu_tree(sni[0], sni[2].get("Menu", "/MenuBar")) if sni else []
+            out.append(s)
+        print(json.dumps(out))
+    elif cmd == "focus":
+        i, _ = pick(clients, args[0])
+        focus(state()[i])
+    elif cmd == "cycle":
+        cycle()
+    elif cmd == "link":
+        # msteams:// and meeting links go to the last-used client (a running instance
+        # receives them as a second-instance deep link and navigates there).
+        if not clients:
+            sys.exit("no clients configured")
+        try:
+            last = open(STATE).read().strip()
+        except OSError:
+            last = ""
+        _, c = pick(clients, last) if last else (0, clients[0])
+        launch(c, extra=args)
+    elif cmd == "start-all":
+        running = main_pids()
+        for c in clients:
+            if profile_dir(c) not in running:
+                launch(c, minimized=True)
+                time.sleep(2)
+    elif cmd == "quit":
+        i, _ = pick(clients, args[0])
+        st = state()[i]
+        qid = st["sni"] and menu_id(st["sni"], "Quit")
+        if qid:
+            click(st["sni"], qid)
+        else:
+            stop(st)
+    elif cmd == "click":
+        i, _ = pick(clients, args[0])
+        st = state()[i]
+        if st["sni"]:
+            click(st["sni"], args[1])
+    elif cmd == "list":
+        for i, c in enumerate(clients):
+            print(f"{i + 1}  {c['name']}  (profile {profile_dir(c)})")
+    elif cmd in ("add", "add-gui"):
+        if cmd == "add":
+            name = " ".join(args).strip()
+        else:
+            r = subprocess.run(["kdialog", "--title", "Add Teams client", "--inputbox",
+                                "Client name (shown in the tray menu):"], capture_output=True, text=True)
+            name = r.stdout.strip() if r.returncode == 0 else ""
+        if not name:
+            return
+        if any(c["slug"] == slugify(name) for c in clients):
+            if cmd == "add-gui":
+                subprocess.run(["kdialog", "--title", "Add Teams client", "--sorry", f"'{name}' already exists."])
+            sys.exit(f"'{name}' already exists")
+        clients.append({"slug": slugify(name), "name": name})
+        save(clients)
+        launch(clients[-1])  # opens so the user can sign in
+    elif cmd == "rename":
+        i, c = pick(clients, args[0])
+        c["name"] = " ".join(args[1:])
+        save(clients)
+        print("renamed; restart that client to update its window title")
+    elif cmd == "remove":
+        i, _ = pick(clients, args[0])
+        stop(state()[i])
+        c = remove(clients, i, delete_data="--delete-data" in args)
+        print(f"removed {c['name']}")
+    elif cmd == "remove-gui":
+        i, c = pick(clients, args[0])
+        r = subprocess.run(["kdialog", "--title", "Remove Teams client", "--warningyesnocancel",
+                            f"Remove {c['name']} from Teams?\n\nKeeping the login data means re-adding it later "
+                            "with the same name needs no sign-in.",
+                            "--yes-label", "Remove, keep login data",
+                            "--no-label", "Remove and delete login data"])
+        if r.returncode not in (0, 1):
+            return
+        stop(state()[i])
+        remove(clients, i, delete_data=r.returncode == 1)
+    elif cmd == "sync":
+        save(clients)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

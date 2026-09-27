@@ -1,0 +1,16 @@
+{
+    "KPlugin": {
+        "Id": "io.github.jamesstuder.teamsclients",
+        "Name": "Teams Clients",
+        "Description": "One tray icon for all Teams for Linux client instances, with each client's own menu",
+        "Icon": "teams-for-linux",
+        "Category": "Utilities",
+        "License": "MIT",
+        "Website": "https://github.com/JamesStuder/teams-for-linux-multiclient",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "Communications"
+}
