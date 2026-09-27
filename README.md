@@ -4,6 +4,11 @@ Run one fully isolated [Teams for Linux](https://github.com/IsmaelMartinez/teams
 
 If you work with several organisations you have probably hit this: the built-in account switcher only shows notifications for the account you're looking at, and running separate instances gives you a row of identical Teams icons in the tray. This keeps the separate instances (so every tenant notifies you, all the time) and collapses them behind one icon.
 
+<p>
+  <img src="docs/tray-menu.png" alt="Tray menu with a submenu per client" height="320">
+  <img src="docs/tray-notifications.png" alt="A client's own notification settings, reached from the shared tray icon" height="320">
+</p>
+
 ## What you get
 
 - **One process per client**, each with its own profile (`--user-data-dir`), window class and icon badge with the client's initials. Every client stays signed in and delivers notifications whether it's focused or not.
