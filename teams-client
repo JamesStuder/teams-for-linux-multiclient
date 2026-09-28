@@ -11,6 +11,7 @@ those tray items and shows every client behind a single icon using `status`/`cli
   teams-client cycle                 bring Teams up / switch to the next client
   teams-client start-all             start every client minimized (autostart)
   teams-client quit N|name           quit that client
+  teams-client quit-all              quit every running client (clean exit, logins are kept)
   teams-client link URL              open a Teams link in the last-used client
   teams-client click N|name ID       trigger an item of the client's own tray menu
   teams-client list | add NAME | rename N NAME | remove N
@@ -44,6 +45,7 @@ PORT_BASE = 9240  # debugging ports are 127.0.0.1-only; one per client, kept in 
 LOGIN_HOSTS = re.compile(r"(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.live\.com|"
                          r"login\.windows\.net|onelogin\.com|okta\.com)$")
 SIGNIN_GRACE = 60  # s; Teams passes through the sign-in page briefly while it refreshes a session
+SIGNIN_FORGET = 600  # s off the sign-in page before a sign-out is forgotten (and may notify again)
 BIN = shutil.which("teams-for-linux") or "/usr/bin/teams-for-linux"
 PLASMOID = "io.github.jamesstuder.teamsclients"
 DBUS_IFACE = "io.github.jamesstuder.TeamsClient"
@@ -332,39 +334,55 @@ def on_signin_page(c):
     return False
 
 
-def notify_signin(c):
+def notify_signin(cs):
+    """One notification for every client that just got signed out; clicking opens the first."""
     script = ('r=$(notify-send -a "Microsoft Teams" -i "$1" --action=open="Sign in" "$2" "$3"); '
               '[ "$r" = open ] && exec "$4" focus "$5"')
-    subprocess.Popen(["sh", "-c", script, "_", icon_path(c), f"Teams – {c['name']}",
-                      "Signed out. Click to sign in again.", SELF, c["slug"]],
+    names = ", ".join(c["name"] for c in cs)
+    body = ("Signed out. Click to sign in again." if len(cs) == 1 else
+            "These clients are signed out. Click to sign in to the first; the tray menu has the rest.")
+    subprocess.Popen(["sh", "-c", script, "_", icon_path(cs[0]), f"Teams – {names}", body, SELF, cs[0]["slug"]],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
 
 
 def signin_needed(st):
     """slug -> True for running clients that have sat on a sign-in page for SIGNIN_GRACE seconds.
-    Notifies once per sign-out; the timestamps live in SIGNIN_STATE."""
-    try:
-        with open(SIGNIN_STATE) as f:
-            seen = json.load(f)
-    except (OSError, ValueError):
-        seen = {}
-    now, out, new = time.time(), {}, {}
-    clients = {c["slug"]: c for c in load()}
-    for s in st:
-        c = clients.get(s["slug"])
-        if not c or not s["pid"] or not on_signin_page(c):
-            continue
-        rec = seen.get(s["slug"], {"since": now, "notified": False})
-        if now - rec["since"] >= SIGNIN_GRACE:
-            out[s["slug"]] = True
-            if not rec["notified"]:
-                notify_signin(c)
-                rec["notified"] = True
-        new[s["slug"]] = rec
-    if new != seen:
-        with open(SIGNIN_STATE, "w") as f:
-            json.dump(new, f)
+    Notifies once per sign-out (grouped), and a client that briefly leaves the sign-in page is
+    remembered for SIGNIN_FORGET seconds so it does not notify again. State lives in SIGNIN_STATE;
+    the lock keeps overlapping `status` polls from notifying twice."""
+    import fcntl
+    with open(SIGNIN_STATE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(SIGNIN_STATE) as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = {}
+        now, out, new, due = time.time(), {}, {}, []
+        clients = {c["slug"]: c for c in load()}
+        for s in st:
+            c, rec = clients.get(s["slug"]), seen.get(s["slug"])
+            if not c:
+                continue
+            if not s["pid"] or not on_signin_page(c):
+                if rec and now - rec.get("seen", rec["since"]) < SIGNIN_FORGET:
+                    new[s["slug"]] = rec
+                continue
+            # a copy, or the change would also land in `seen` and never be saved
+            rec = dict(rec) if rec else {"since": now, "notified": False}
+            rec["seen"] = now
+            if now - rec["since"] >= SIGNIN_GRACE:
+                out[s["slug"]] = True
+                if not rec["notified"]:
+                    due.append(c)
+                    rec["notified"] = True
+            new[s["slug"]] = rec
+        if due:
+            notify_signin(due)
+        if new != seen:
+            with open(SIGNIN_STATE, "w") as f:
+                json.dump(new, f)
     return out
 
 
@@ -571,6 +589,17 @@ def main():
             click(st["sni"], qid)
         else:
             stop(st)
+    elif cmd == "quit-all":
+        # Use each client's own tray "Quit" so it exits cleanly and flushes its session to
+        # disk; a SIGTERM fallback only for clients without a tray item.
+        for st in state():
+            if not st["pid"]:
+                continue
+            qid = st["sni"] and menu_id(st["sni"], "Quit")
+            if qid:
+                click(st["sni"], qid)
+            else:
+                stop(st)
     elif cmd == "click":
         i, _ = pick(clients, args[0])
         st = state()[i]

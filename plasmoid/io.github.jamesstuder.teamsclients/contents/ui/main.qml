@@ -147,6 +147,8 @@ PlasmoidItem {
         if (clients.length > 0)
             addSep(menu)
         addItem(menu, "Start all clients", () => root.run("start-all"), { icon: "media-playback-start" })
+        if (root.anyRunning)
+            addItem(menu, "Quit all clients", () => root.run("quit-all"), { icon: "application-exit" })
         addItem(menu, "Add client…", () => root.run("add-gui"), { icon: "list-add" })
         if (clients.length > 0) {
             const rm = addSub(menu, "Remove client")
