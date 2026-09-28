@@ -48,10 +48,15 @@ teams-client focus 2|contoso    start or bring a client to the front
 teams-client cycle              same as Meta+Shift+T
 teams-client rename 2 "Contoso Ltd"
 teams-client remove 2 [--delete-data]
+teams-client set-url 2 "https://teams.microsoft.com/v2/?tenantId=<guest tenant id>"
 teams-client start-all          start everything minimized
 ```
 
 Clients are stored in `~/.config/teams-clients/clients.json`; each profile lives in `~/.config/teams-client-<slug>`.
+
+A client that is a guest in another organisation can open straight into that tenant with `set-url`. This helps when the in-app tenant switch fails; the switch can bounce back to the home tenant right after MFA even though the same account signs in to that organisation fine in a browser.
+
+The tray icon also warns when a client is signed out. Each client gets a local-only debugging port (127.0.0.1, stored as `port` in `clients.json`), and `teams-client status` flags any client whose page is a Microsoft or SSO sign-in page. The icon shows a warning mark and the tooltip and menu name the client to sign in again.
 
 ## How it works
 

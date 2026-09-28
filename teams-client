@@ -15,8 +15,17 @@ those tray items and shows every client behind a single icon using `status`/`cli
   teams-client click N|name ID       trigger an item of the client's own tray menu
   teams-client list | add NAME | rename N NAME | remove N
   teams-client add-gui | remove-gui N    the same, with KDE dialogs (used by the tray menu)
+  teams-client set-url N [URL]       start that client at URL, e.g. a guest tenant
+                                     (https://teams.microsoft.com/v2/?tenantId=ID); no URL clears it
+
+Signed-out detection: every client is started with a Chromium debugging port on 127.0.0.1
+(stored as "port" in clients.json). `status` reads only the address and title of each
+client's pages from it; a client that stays on a Microsoft/SSO sign-in page is reported as
+"signin" and gets one desktop notification. Teams for Linux's own stale-session recovery
+(auth.reauthRecovery) is switched on in each profile's config.json, so a stale session
+either recovers by itself or ends up on the sign-in page, where it is detected.
 """
-import json, os, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
 import warnings
 from gi.repository import Gio, GLib
 
@@ -29,6 +38,12 @@ ICONS = f"{HOME}/.local/share/icons/teams-clients"
 APPS = f"{HOME}/.local/share/applications"
 AUTOSTART = f"{HOME}/.config/autostart"
 STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.last"
+SIGNIN_STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.signin.json"
+PORT_BASE = 9240  # debugging ports are 127.0.0.1-only; one per client, kept in clients.json
+# A page on one of these hosts means the client is waiting for the user to sign in.
+LOGIN_HOSTS = re.compile(r"(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.live\.com|"
+                         r"login\.windows\.net|onelogin\.com|okta\.com)$")
+SIGNIN_GRACE = 60  # s; Teams passes through the sign-in page briefly while it refreshes a session
 BIN = shutil.which("teams-for-linux") or "/usr/bin/teams-for-linux"
 PLASMOID = "io.github.jamesstuder.teamsclients"
 DBUS_IFACE = "io.github.jamesstuder.TeamsClient"
@@ -55,9 +70,18 @@ def base_icon():
 def load():
     try:
         with open(CONF) as f:
-            return json.load(f)["clients"]
+            clients = json.load(f)["clients"]
     except FileNotFoundError:
         return []
+    used = {c.get("port") for c in clients}
+    missing = [c for c in clients if not c.get("port")]
+    for c in missing:
+        c["port"] = next(p for p in range(PORT_BASE, PORT_BASE + 1000) if p not in used)
+        used.add(c["port"])
+    if missing:
+        with open(CONF, "w") as f:
+            json.dump({"clients": clients}, f, indent=2)
+    return clients
 
 
 def save(clients):
@@ -284,6 +308,62 @@ def state():
     return out
 
 
+# ---- signed-out detection -------------------------------------------------
+
+def on_signin_page(c):
+    """True/False whether a page of the client shows a sign-in page; None if its port is not answering."""
+    if not c.get("port"):
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{c['port']}/json/list", timeout=0.5) as r:
+            targets = json.load(r)
+    except (OSError, ValueError):
+        return None
+    for t in targets:
+        if t.get("type") != "page":  # skip the hidden sign-in iframes MSAL uses to refresh tokens
+            continue
+        host = urllib.parse.urlparse(t.get("url", "")).hostname or ""
+        if LOGIN_HOSTS.search(host) or t.get("title") == "Sign in to your account":
+            return True
+    return False
+
+
+def notify_signin(c):
+    script = ('r=$(notify-send -a "Microsoft Teams" -i "$1" --action=open="Sign in" "$2" "$3"); '
+              '[ "$r" = open ] && exec "$4" focus "$5"')
+    subprocess.Popen(["sh", "-c", script, "_", icon_path(c), f"Teams – {c['name']}",
+                      "Signed out. Click to sign in again.", SELF, c["slug"]],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def signin_needed(st):
+    """slug -> True for running clients that have sat on a sign-in page for SIGNIN_GRACE seconds.
+    Notifies once per sign-out; the timestamps live in SIGNIN_STATE."""
+    try:
+        with open(SIGNIN_STATE) as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+    now, out, new = time.time(), {}, {}
+    clients = {c["slug"]: c for c in load()}
+    for s in st:
+        c = clients.get(s["slug"])
+        if not c or not s["pid"] or not on_signin_page(c):
+            continue
+        rec = seen.get(s["slug"], {"since": now, "notified": False})
+        if now - rec["since"] >= SIGNIN_GRACE:
+            out[s["slug"]] = True
+            if not rec["notified"]:
+                notify_signin(c)
+                rec["notified"] = True
+        new[s["slug"]] = rec
+    if new != seen:
+        with open(SIGNIN_STATE, "w") as f:
+            json.dump(new, f)
+    return out
+
+
 # ---- windows (via a one-shot KWin script that reports back over D-Bus) -----
 
 def kwin_run(js, name):
@@ -345,15 +425,36 @@ def menu_id(sni, label):
             return it["id"]
 
 
+def write_app_config(c):
+    """Switch on Teams for Linux's own stale-session recovery in the client's config.json."""
+    path = f"{profile_dir(c)}/config.json"
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    rr = cfg.setdefault("auth", {}).setdefault("reauthRecovery", {})
+    if rr.get("enabled") is not True:
+        rr["enabled"] = True
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+
+
 def launch(c, minimized=False, extra=()):
+    c = next((x for x in load() if x["slug"] == c["slug"]), c)  # picks up the assigned port
     args = [BIN, "--gtk-version=3", f"--class={wm_class(c)}", f"--user-data-dir={profile_dir(c)}",
             f"--appTitle=Teams - {c['name']}"]
+    if c.get("port"):
+        args += [f"--remote-debugging-port={c['port']}", "--remote-debugging-address=127.0.0.1"]
     if os.path.exists(icon_path(c)):
         args.append(f"--appIcon={icon_path(c)}")
+    if c.get("url"):
+        args.append(f"--url={c['url']}")
     if minimized:
         args.append("--minimized")
     args += list(extra)
     os.makedirs(profile_dir(c), exist_ok=True)
+    write_app_config(c)
     subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
 
@@ -427,8 +528,10 @@ def main():
     if cmd == "setup":
         setup(shortcuts="--no-shortcuts" not in args)
     elif cmd == "status":
-        out = []
-        for s in state():
+        out, st = [], state()
+        signin = signin_needed(st)
+        for s in st:
+            s["signin"] = signin.get(s["slug"], False)
             sni = s.pop("sni")
             s["running"] = bool(s.pop("pid"))
             s["menu"] = menu_tree(sni[0], sni[2].get("Menu", "/MenuBar")) if sni else []
@@ -493,6 +596,14 @@ def main():
         c["name"] = " ".join(args[1:])
         save(clients)
         print("renamed; restart that client to update its window title")
+    elif cmd == "set-url":
+        i, c = pick(clients, args[0])
+        if len(args) > 1 and args[1]:
+            c["url"] = args[1]
+        else:
+            c.pop("url", None)
+        save(clients)
+        print("saved; restart that client to use it")
     elif cmd == "remove":
         i, _ = pick(clients, args[0])
         stop(state()[i])

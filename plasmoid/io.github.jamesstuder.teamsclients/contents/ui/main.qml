@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as P5Support
 import org.kde.kirigami as Kirigami
 
@@ -15,16 +16,18 @@ PlasmoidItem {
     property var clients: []
     readonly property int unread: clients.reduce((n, c) => n + c.unread, 0)
     readonly property bool anyRunning: clients.some(c => c.running)
-    property var menu: null
+    readonly property int signedOut: clients.filter(c => c.signin).length
 
     function run(args) { exec.connectSource(tool + " " + args + " #" + Date.now()) }
 
     Plasmoid.icon: "teams-for-linux"
-    Plasmoid.status: unread > 0 ? PlasmaCore.Types.NeedsAttentionStatus : PlasmaCore.Types.ActiveStatus
-    toolTipMainText: unread > 0 ? `Microsoft Teams: ${unread} unread` : "Microsoft Teams"
+    Plasmoid.status: unread > 0 || signedOut > 0 ? PlasmaCore.Types.NeedsAttentionStatus : PlasmaCore.Types.ActiveStatus
+    toolTipMainText: signedOut > 0 ? `Microsoft Teams: ${signedOut} signed out`
+        : unread > 0 ? `Microsoft Teams: ${unread} unread` : "Microsoft Teams"
     toolTipSubText: clients.length === 0 ? "No clients configured (teams-client add NAME)"
         : clients.map(c => `Meta+Shift+${c.n}  ${c.name}: ` +
-            (!c.running ? "not running" : c.unread > 0 ? `${c.unread} unread` : "no new messages")).join("\n")
+            (!c.running ? "not running" : c.signin ? "⚠ signed out, sign in again"
+                : c.unread > 0 ? `${c.unread} unread` : "no new messages")).join("\n")
         + "\n\nClick: client menus"
     preferredRepresentation: compactRepresentation
 
@@ -38,6 +41,14 @@ PlasmoidItem {
             source: Plasmoid.icon
             active: mouse.containsMouse
             opacity: root.anyRunning ? 1.0 : 0.4
+        }
+        // Signed-out warning, top left (the unread badge sits bottom right)
+        Kirigami.Icon {
+            visible: root.signedOut > 0
+            anchors { left: parent.left; top: parent.top }
+            width: Math.round(parent.width * 0.55)
+            height: width
+            source: "dialog-warning"
         }
         Rectangle {
             visible: root.unread > 0
@@ -65,75 +76,83 @@ PlasmoidItem {
     }
     fullRepresentation: Item {}
 
-    Component { id: menuComp; QQC2.Menu { popupType: QQC2.Popup.Window } }
-    Component { id: sepComp; QQC2.MenuSeparator {} }
+    // PlasmaExtras.Menu is a native QMenu. QQC2 Popup.Window menus crashed plasmashell
+    // whenever they were destroyed (freed QQuickWindow still queued for a redraw).
+    PlasmaExtras.Menu { id: menu }
+    Component { id: menuComp; PlasmaExtras.Menu {} }
     Component {
         id: itemComp
-        QQC2.MenuItem {
+        PlasmaExtras.MenuItem {
             property var cb
-            onTriggered: cb()
+            onClicked: if (cb) cb()
         }
     }
+    property var built: []
 
-    function addItem(menu, text, cb, extra) {
-        const it = itemComp.createObject(menu, Object.assign({ text: text, cb: cb }, extra || {}))
-        menu.addItem(it)
+    function addItem(m, text, cb, extra) {
+        const it = itemComp.createObject(m, Object.assign({ text: text, cb: cb }, extra || {}))
+        m.addMenuItem(it)
+        built.push(it)
+        return it
+    }
+    function addSep(m) {
+        const it = itemComp.createObject(m, { separator: true })
+        m.addMenuItem(it)
+        built.push(it)
+    }
+    function addSub(m, title, extra) {
+        const it = addItem(m, title, null, extra)
+        const sub = menuComp.createObject(m, { visualParent: it.action })
+        built.push(sub)
+        return sub
     }
 
     // Mirror a client's native tray menu (JSON from `teams-client status`).
-    function addNative(menu, slug, items) {
+    function addNative(m, slug, items) {
         for (const it of items) {
             if (it.type === "separator") {
-                menu.addItem(sepComp.createObject(menu))
+                addSep(m)
             } else if (it.children.length > 0) {
-                const sub = menuComp.createObject(menu, { title: it.label, enabled: it.enabled })
-                addNative(sub, slug, it.children)
-                menu.addMenu(sub)
+                addNative(addSub(m, it.label, { enabled: it.enabled }), slug, it.children)
             } else {
                 const id = it.id
-                addItem(menu, it.label, () => root.run(`click ${slug} ${id}`),
+                addItem(m, it.label, () => root.run(`click ${slug} ${id}`),
                         { enabled: it.enabled, checkable: it.checkable, checked: it.checked })
             }
         }
     }
 
     function openMenu(parentItem, x, y) {
-        // Destroying a Popup.Window menu right away can crash plasmashell (a queued
-        // redraw hits the freed window), so old menus are closed and deleted later.
-        if (menu) {
-            if (menu.visible) { menu.close(); return }
-        }
-        const m = menuComp.createObject(parentItem)
-        m.closed.connect(() => {
-            m.destroy(5000)
-            if (root.menu === m) root.menu = null
-        })
-        menu = m
+        if (menu.status === PlasmaExtras.Menu.Open) { menu.close(); return }
+        // The menu is closed here, so tearing down the previous build is safe.
+        menu.clearMenuItems()
+        for (const o of built) o.destroy()
+        built = []
         for (const c of clients) {
             const slug = c.slug
-            const title = `${c.n}  ${c.name}` + (c.unread > 0 ? `  (${c.unread})` : c.running ? "" : "  (not running)")
-            const sub = menuComp.createObject(menu, { title: title })
-            addItem(sub, c.running ? "Show" : "Start", () => root.run(`focus ${slug}`),
-                    { icon: { name: "window" } })
+            const title = `${c.n}  ${c.name}` + (c.signin ? "  ⚠ signed out" : c.unread > 0 ? `  (${c.unread})`
+                : c.running ? "" : "  (not running)")
+            const sub = addSub(menu, title, c.signin ? { icon: "dialog-warning" } : undefined)
+            addItem(sub, c.signin ? "Sign in" : c.running ? "Show" : "Start", () => root.run(`focus ${slug}`),
+                    { icon: c.signin ? "dialog-password" : "window" })
             if (c.running && c.menu.length > 0) {
-                sub.addItem(sepComp.createObject(sub))
+                addSep(sub)
                 addNative(sub, slug, c.menu)
             }
-            menu.addMenu(sub)
         }
         if (clients.length > 0)
-            menu.addItem(sepComp.createObject(menu))
-        addItem(menu, "Start all clients", () => root.run("start-all"), { icon: { name: "media-playback-start" } })
-        addItem(menu, "Add client…", () => root.run("add-gui"), { icon: { name: "list-add" } })
+            addSep(menu)
+        addItem(menu, "Start all clients", () => root.run("start-all"), { icon: "media-playback-start" })
+        addItem(menu, "Add client…", () => root.run("add-gui"), { icon: "list-add" })
         if (clients.length > 0) {
-            const rm = menuComp.createObject(menu, { title: "Remove client" })
+            const rm = addSub(menu, "Remove client")
             for (const c of clients) {
                 const slug = c.slug
                 addItem(rm, c.name, () => root.run(`remove-gui ${slug}`))
             }
-            menu.addMenu(rm)
         }
-        menu.popup(parentItem, x, y)
+        menu.visualParent = parentItem
+        menu.open(x, y)
     }
 
     P5Support.DataSource {
