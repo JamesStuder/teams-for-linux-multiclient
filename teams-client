@@ -216,9 +216,13 @@ MimeType=x-scheme-handler/msteams;
     subprocess.run(["update-desktop-database", APPS], check=False, stderr=subprocess.DEVNULL)
     subprocess.run(["xdg-mime", "default", "teams-for-linux.desktop", "x-scheme-handler/msteams"],
                    check=False, stderr=subprocess.DEVNULL)
+    # Starting before the keyring is unlocked makes Electron lose its cookie key (signs
+    # every client out), so go through wait-for-keyring when it is installed.
+    wait = f"{HOME}/.local/bin/wait-for-keyring"
+    prefix = f"{wait} " if os.path.exists(wait) else ""
     desktop_file(f"{AUTOSTART}/teams-clients.desktop", f"""Name=Teams clients
 Comment=Start every Teams client minimized so notifications arrive
-Exec={SELF} start-all
+Exec={prefix}{SELF} start-all
 Icon=teams-for-linux
 X-KDE-autostart-phase=2
 """)
