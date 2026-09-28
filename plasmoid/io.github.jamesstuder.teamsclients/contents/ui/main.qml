@@ -126,7 +126,11 @@ PlasmoidItem {
         if (menu.status === PlasmaExtras.Menu.Open) { menu.close(); return }
         // The menu is closed here, so tearing down the previous build is safe.
         menu.clearMenuItems()
-        for (const o of built) o.destroy()
+        // clearMenuItems() already deletes the MenuItems it held, so some entries are gone;
+        // destroying those throws and used to abort the whole menu.
+        for (const o of built) {
+            try { if (o && typeof o.destroy === "function") o.destroy() } catch (e) {}
+        }
         built = []
         for (const c of clients) {
             const slug = c.slug
