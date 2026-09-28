@@ -259,6 +259,9 @@ def main_pids():
     return out
 
 
+SNI_PROPS = ("Id", "ToolTip", "Menu")
+
+
 def sni_items():
     """StatusNotifierItem Id -> (service, path, props)."""
     out = {}
@@ -271,10 +274,16 @@ def sni_items():
         svc, _, path = it.partition("/")
         if "StatusNotifierItem-" not in svc:  # Electron registers under a well-known name like this
             continue
-        try:
-            props = dbus(svc, "/" + path, "org.freedesktop.DBus.Properties", "GetAll",
-                         GLib.Variant("(s)", ("org.kde.StatusNotifierItem",)), 500)[0]
-        except GLib.Error:
+        # Only the few properties we use: GetAll also returns the icon pixmaps, and unpacking
+        # those costs ~0.5 s of CPU per client on every poll.
+        props = {}
+        for name in SNI_PROPS:
+            try:
+                props[name] = dbus(svc, "/" + path, "org.freedesktop.DBus.Properties", "Get",
+                                   GLib.Variant("(ss)", ("org.kde.StatusNotifierItem", name)), 500)[0]
+            except GLib.Error:
+                pass
+        if "Id" not in props:
             continue
         out[props.get("Id", "")] = (svc, "/" + path, props)
     return out
