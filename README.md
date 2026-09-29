@@ -68,6 +68,7 @@ Teams for Linux doesn't show a desktop notification when a scheduled meeting sta
 
 - Each client runs as `teams-for-linux --class=teams-<slug> --user-data-dir=~/.config/teams-client-<slug> …`, the separate-instances approach from the upstream [multiple instances docs](https://github.com/IsmaelMartinez/teams-for-linux/blob/main/docs-site/docs/multiple-instances.md).
 - Electron registers each tray icon as a StatusNotifierItem with Id `teams-<slug>_status_icon_1`. `teams-client` lists them in the system tray's `hiddenItems`, reads each one's unread count from its tooltip and its menu over `com.canonical.dbusmenu`, and forwards clicks back through the same interface.
+- The `teams-client-status` user service (`teams-client status-daemon`) refreshes the status every 3 s into `$XDG_RUNTIME_DIR/teams-client.status.json`, and the plasmoid just reads that file, so polling doesn't start Python every few seconds. If the file is missing or stale the plasmoid runs `teams-client status` itself.
 - Windows are found and raised with one-shot KWin scripts. A window that was hidden to the tray is brought back by triggering that client's own *Open* menu item.
 - Shortcuts are registered with kglobalaccel as launch shortcuts for small `.desktop` files, so they show up (and can be changed) in System Settings → Shortcuts.
 

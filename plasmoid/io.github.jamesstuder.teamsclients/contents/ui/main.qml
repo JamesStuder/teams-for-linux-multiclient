@@ -12,7 +12,10 @@ PlasmoidItem {
     id: root
 
     readonly property string tool: "\"$HOME/.local/bin/teams-client\""
-    readonly property string pollCmd: tool + " status"
+    // teams-client status-daemon keeps the status in a file (cheap to read every poll);
+    // run `status` directly if the file is missing or stale (daemon not running).
+    readonly property string pollCmd: "f=\"$XDG_RUNTIME_DIR/teams-client.status.json\"; " +
+        "if [ -n \"$(find \"$f\" -newermt '-15 seconds' 2>/dev/null)\" ]; then cat \"$f\"; else " + tool + " status; fi"
     property var clients: []
     readonly property int unread: clients.reduce((n, c) => n + c.unread, 0)
     readonly property bool anyRunning: clients.some(c => c.running)

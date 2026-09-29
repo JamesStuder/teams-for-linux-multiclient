@@ -7,6 +7,8 @@ those tray items and shows every client behind a single icon using `status`/`cli
 
   teams-client setup                 install launchers, shortcuts, autostart, tray config
   teams-client status                JSON for the tray plasmoid
+  teams-client status-daemon         keep that JSON in $XDG_RUNTIME_DIR/teams-client.status.json
+                                     (run by a user service; the plasmoid reads the file)
   teams-client focus N|name          start or bring that client to the front
   teams-client cycle                 bring Teams up / switch to the next client
   teams-client start-all             start every client minimized (autostart)
@@ -46,6 +48,8 @@ APPS = f"{HOME}/.local/share/applications"
 AUTOSTART = f"{HOME}/.config/autostart"
 STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.last"
 SIGNIN_STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.signin.json"
+STATUS_FILE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/teams-client.status.json"
+STATUS_EVERY = 3  # s; how often status-daemon refreshes STATUS_FILE
 PORT_BASE = 9240  # debugging ports are 127.0.0.1-only; one per client, kept in clients.json
 # A page on one of these hosts means the client is waiting for the user to sign in.
 LOGIN_HOSTS = re.compile(r"(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.live\.com|"
@@ -253,8 +257,24 @@ RestartSec=5
 [Install]
 WantedBy=graphical-session.target
 """)
+    with open(f"{units}/teams-client-status.service", "w") as f:
+        f.write(f"""[Unit]
+Description=Keep the Teams Clients tray status up to date
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart={SELF} status-daemon
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+""")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "teams-client-status.service"],
+                   check=False, stderr=subprocess.DEVNULL)
     if shutil.which("mosquitto_sub"):
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         subprocess.run(["systemctl", "--user", "enable", "--now", "teams-meeting-watch.service"],
                        check=False, stderr=subprocess.DEVNULL)
         for c in load():
@@ -626,21 +646,51 @@ def remove(clients, i, delete_data=False):
     return c
 
 
+def status_json():
+    out, st = [], state()
+    signin = signin_needed(st)
+    for s in st:
+        s["signin"] = signin.get(s["slug"], False)
+        sni = s.pop("sni")
+        s["running"] = bool(s.pop("pid"))
+        s["menu"] = menu_tree(sni[0], sni[2].get("Menu", "/MenuBar")) if sni else []
+        out.append(s)
+    return json.dumps(out)
+
+
+def status_daemon():
+    """Write `status` to STATUS_FILE every STATUS_EVERY seconds, so the tray plasmoid only
+    has to read a file instead of starting Python every poll. The plasmoid falls back to
+    `status` when the file is missing or older than 15 s."""
+    import signal
+    def bye(*_):
+        try:
+            os.unlink(STATUS_FILE)
+        except OSError:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    while True:
+        try:
+            data = status_json()
+            with open(STATUS_FILE + ".tmp", "w") as f:
+                f.write(data)
+            os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
+        except Exception as e:
+            print("status failed:", e, file=sys.stderr, flush=True)
+        time.sleep(STATUS_EVERY)
+
+
 def main():
     cmd, args = (sys.argv[1] if len(sys.argv) > 1 else "cycle"), sys.argv[2:]
     clients = load()
     if cmd == "setup":
         setup(shortcuts="--no-shortcuts" not in args)
     elif cmd == "status":
-        out, st = [], state()
-        signin = signin_needed(st)
-        for s in st:
-            s["signin"] = signin.get(s["slug"], False)
-            sni = s.pop("sni")
-            s["running"] = bool(s.pop("pid"))
-            s["menu"] = menu_tree(sni[0], sni[2].get("Menu", "/MenuBar")) if sni else []
-            out.append(s)
-        print(json.dumps(out))
+        print(status_json())
+    elif cmd == "status-daemon":
+        status_daemon()
     elif cmd == "focus":
         i, _ = pick(clients, args[0])
         focus(state()[i])
