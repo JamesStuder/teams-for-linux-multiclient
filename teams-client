@@ -18,6 +18,7 @@ those tray items and shows every client behind a single icon using `status`/`cli
   teams-client add-gui | remove-gui N    the same, with KDE dialogs (used by the tray menu)
   teams-client set-url N [URL]       start that client at URL, e.g. a guest tenant
                                      (https://teams.microsoft.com/v2/?tenantId=ID); no URL clears it
+  teams-client meeting-watch         desktop notification when a meeting starts (run by a user service)
 
 Signed-out detection: every client is started with a Chromium debugging port on 127.0.0.1
 (stored as "port" in clients.json). `status` reads only the address and title of each
@@ -25,6 +26,11 @@ client's pages from it; a client that stays on a Microsoft/SSO sign-in page is r
 "signin" and gets one desktop notification. Teams for Linux's own stale-session recovery
 (auth.reauthRecovery) is switched on in each profile's config.json, so a stale session
 either recovers by itself or ends up on the sign-in page, where it is detected.
+
+Meeting-start notifications: Teams for Linux detects the "meeting started" toast but only
+publishes it over MQTT. When mosquitto is installed, each profile's config.json points
+Teams for Linux at the local broker (topic teams-clients/<slug>/meeting-started) and the
+teams-meeting-watch user service turns each pulse into a desktop notification.
 """
 import json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
 import warnings
@@ -50,6 +56,9 @@ BIN = shutil.which("teams-for-linux") or "/usr/bin/teams-for-linux"
 PLASMOID = "io.github.jamesstuder.teamsclients"
 DBUS_IFACE = "io.github.jamesstuder.TeamsClient"
 HIDDEN_LABELS = {"Quit (Clear Storage)"}  # one click logs the client out; too easy to hit by accident
+MQTT_URL = "mqtt://127.0.0.1:1883"  # local mosquitto; Teams for Linux only reports meeting starts over MQTT
+MQTT_PREFIX = "teams-clients"
+MEETING_DEDUP = 300  # s; Teams can re-announce the same meeting start
 COLORS = ["#d9534f", "#2e86de", "#27ae60", "#f39c12", "#8e44ad", "#16a085", "#c0392b", "#34495e", "#e67e22"]
 
 bus = Gio.bus_get_sync(Gio.BusType.SESSION)
@@ -228,6 +237,28 @@ Exec={prefix}{SELF} start-all
 Icon=teams-for-linux
 X-KDE-autostart-phase=2
 """)
+    units = f"{HOME}/.config/systemd/user"
+    os.makedirs(units, exist_ok=True)
+    with open(f"{units}/teams-meeting-watch.service", "w") as f:
+        f.write(f"""[Unit]
+Description=Desktop notification when a Teams meeting starts
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart={SELF} meeting-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+""")
+    if shutil.which("mosquitto_sub"):
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "teams-meeting-watch.service"],
+                       check=False, stderr=subprocess.DEVNULL)
+        for c in load():
+            write_app_config(c)
     if shortcuts:
         try:
             register_shortcut("teams-cycle.desktop", "Microsoft Teams (all clients)", ord("T"))
@@ -355,6 +386,36 @@ def notify_signin(cs):
                      start_new_session=True)
 
 
+def notify_meeting(c):
+    script = ('r=$(notify-send -a "Microsoft Teams" -u critical -i "$1" --action=open="Open Teams" "$2" "$3"); '
+              '[ "$r" = open ] && exec "$4" focus "$5"')
+    subprocess.Popen(["sh", "-c", script, "_", icon_path(c), f"Teams – {c['name']}", "A meeting has started.",
+                      SELF, c["slug"]],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def meeting_watch():
+    """Follow every client's meeting-started topic and notify once per meeting start."""
+    last = {}
+    while True:
+        # -R skips retained (stale) messages, so a restart does not re-announce old meetings.
+        p = subprocess.Popen(["mosquitto_sub", "-h", "127.0.0.1", "-R", "-v",
+                              "-t", f"{MQTT_PREFIX}/+/meeting-started"],
+                             stdout=subprocess.PIPE, text=True)
+        for line in p.stdout:
+            topic, _, value = line.strip().partition(" ")
+            slug = topic.split("/")[1]
+            if value != "true" or time.time() - last.get(slug, 0) < MEETING_DEDUP:
+                continue
+            c = next((x for x in load() if x["slug"] == slug), None)
+            if c:
+                last[slug] = time.time()
+                notify_meeting(c)
+        p.wait()
+        time.sleep(5)
+
+
 def signin_needed(st):
     """slug -> True for running clients that have sat on a sign-in page for SIGNIN_GRACE seconds.
     Notifies once per sign-out (grouped), and a client that briefly leaves the sign-in page is
@@ -457,16 +518,28 @@ def menu_id(sni, label):
 
 
 def write_app_config(c):
-    """Switch on Teams for Linux's own stale-session recovery in the client's config.json."""
+    """Switch on Teams for Linux's stale-session recovery (and, with mosquitto, meeting-start
+    reporting to the local broker) in the client's config.json. Read at the client's next start."""
     path = f"{profile_dir(c)}/config.json"
     try:
         with open(path) as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         cfg = {}
-    rr = cfg.setdefault("auth", {}).setdefault("reauthRecovery", {})
-    if rr.get("enabled") is not True:
-        rr["enabled"] = True
+    before = json.dumps(cfg, sort_keys=True)
+    cfg.setdefault("auth", {}).setdefault("reauthRecovery", {})["enabled"] = True
+    if shutil.which("mosquitto_sub"):
+        mq = cfg.setdefault("mqtt", {})
+        # The whole block is written out: a partial mqtt object may replace the app defaults.
+        mq.update(enabled=True, brokerUrl=MQTT_URL, clientId=f"teams-client-{c['slug']}",
+                  topicPrefix=f"{MQTT_PREFIX}/{c['slug']}")
+        for k, v in (("statusTopic", "status"), ("commandTopic", ""), ("statusCheckInterval", 10000)):
+            mq.setdefault(k, v)
+        msd = mq.setdefault("meetingStartDetection", {})
+        msd["enabled"] = True
+        msd.setdefault("patterns", ["meeting started", "started the meeting"])
+        msd.setdefault("resetSeconds", 10)
+    if json.dumps(cfg, sort_keys=True) != before:
         with open(path, "w") as f:
             json.dump(cfg, f, indent=2)
 
@@ -662,6 +735,8 @@ def main():
             return
         stop(state()[i])
         remove(clients, i, delete_data=r.returncode == 1)
+    elif cmd == "meeting-watch":
+        meeting_watch()
     elif cmd == "sync":
         save(clients)
     else:

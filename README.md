@@ -19,6 +19,7 @@ If you work with several organisations you have probably hit this: the built-in 
 - All clients start minimized at login.
 - Optional global shortcuts: `Meta+Shift+T` brings Teams up (a client with unread messages first) or moves to the next client; `Meta+Shift+1…9` jumps to client N.
 - `msteams:` / meeting links open in the client you used last.
+- Optional: a desktop notification when a scheduled meeting starts (someone joins or starts it), naming the client. Needs `mosquitto`; see below.
 
 ## Requirements
 
@@ -26,6 +27,7 @@ If you work with several organisations you have probably hit this: the built-in 
 - [Teams for Linux](https://github.com/IsmaelMartinez/teams-for-linux) (tested with 2.23) installed as `teams-for-linux` (distro package or AppImage/deb/rpm on `PATH`; Flatpak isn't supported)
 - `python-gobject` (PyGObject), `kdialog`
 - Optional: ImageMagick (`magick`) for the per-client icon badges
+- Optional: `mosquitto` (broker running on localhost) for meeting-start notifications
 
 ## Install
 
@@ -57,6 +59,10 @@ Clients are stored in `~/.config/teams-clients/clients.json`; each profile lives
 A client that is a guest in another organisation can open straight into that tenant with `set-url`. This helps when the in-app tenant switch fails; the switch can bounce back to the home tenant right after MFA even though the same account signs in to that organisation fine in a browser.
 
 The tray icon also warns when a client is signed out. Each client gets a local-only debugging port (127.0.0.1, stored as `port` in `clients.json`), and `teams-client status` flags any client whose page is a Microsoft or SSO sign-in page. The icon shows a warning mark and the tooltip and menu name the client to sign in again.
+
+### Meeting-start notifications
+
+Teams for Linux doesn't show a desktop notification when a scheduled meeting starts. It can spot Teams' own "meeting started" toast (an experimental feature), but it only reports that over MQTT. If `mosquitto` is installed and running on 127.0.0.1:1883 when `teams-client setup` runs, each profile's `config.json` gets an `mqtt` block that points at the local broker (topic `teams-clients/<slug>/meeting-started`), and the `teams-meeting-watch` user service turns each report into a notification with an *Open Teams* button. The new config is read when a client next starts, so restart the clients once (tray menu → Quit all clients, then Start all clients).
 
 ## How it works
 
