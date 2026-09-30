@@ -58,7 +58,18 @@ Clients are stored in `~/.config/teams-clients/clients.json`; each profile lives
 
 A client that is a guest in another organisation can open straight into that tenant with `set-url`. This helps when the in-app tenant switch fails; the switch can bounce back to the home tenant right after MFA even though the same account signs in to that organisation fine in a browser.
 
-The tray icon also warns when a client is signed out. Each client gets a local-only debugging port (127.0.0.1, stored as `port` in `clients.json`), and `teams-client status` flags any client whose page is a Microsoft or SSO sign-in page. The icon shows a warning mark and the tooltip and menu name the client to sign in again.
+### Signed-out warning (optional, off by default)
+
+The tray icon can warn when a client is signed out: the icon shows a warning mark, and the tooltip and menu name the client to sign in again. It's **off by default** because it needs Chromium's remote debugging port.
+
+> **Security warning:** the debugging port has no authentication. With the check on, any process running on this computer, as any user, can connect to a client's port and read or control its signed-in Teams session, including cookies and tokens. Only switch it on if you trust everything that runs on the machine.
+
+```sh
+teams-client signin-check on     # or off; without an argument it shows the current setting
+teams-client quit-all && teams-client start-all   # restart the clients to apply
+```
+
+With it on, each client gets a debugging port on 127.0.0.1 (stored as `port` in `clients.json`), and `teams-client status` flags any client whose page is a Microsoft or SSO sign-in page. With it off, no port is opened. Teams for Linux's own stale-session recovery is enabled either way, so a signed-out client shows its sign-in page as soon as you open it.
 
 ### Meeting-start notifications
 

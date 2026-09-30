@@ -21,13 +21,18 @@ those tray items and shows every client behind a single icon using `status`/`cli
   teams-client set-url N [URL]       start that client at URL, e.g. a guest tenant
                                      (https://teams.microsoft.com/v2/?tenantId=ID); no URL clears it
   teams-client meeting-watch         desktop notification when a meeting starts (run by a user service)
+  teams-client signin-check [on|off] show or switch the signed-out warning (off by default, see below)
 
-Signed-out detection: every client is started with a Chromium debugging port on 127.0.0.1
-(stored as "port" in clients.json). `status` reads only the address and title of each
-client's pages from it; a client that stays on a Microsoft/SSO sign-in page is reported as
-"signin" and gets one desktop notification. Teams for Linux's own stale-session recovery
-(auth.reauthRecovery) is switched on in each profile's config.json, so a stale session
-either recovers by itself or ends up on the sign-in page, where it is detected.
+Signed-out detection (OPT-IN, off by default): `teams-client signin-check on` starts every
+client with a Chromium debugging port on 127.0.0.1 (stored as "port" in clients.json).
+`status` reads only the address and title of each client's pages from it; a client that stays
+on a Microsoft/SSO sign-in page is reported as "signin" and gets one desktop notification.
+WARNING: that port has no authentication. Any process running on this computer, as any
+user, can connect to it and read or control the signed-in Teams session, including its
+cookies and tokens. Only switch it on if you trust everything that runs on the machine.
+Teams for Linux's own stale-session recovery (auth.reauthRecovery) is switched on in each
+profile's config.json either way, so a stale session recovers by itself or ends up on the
+sign-in page, which you see as soon as you open that client.
 
 Meeting-start notifications: Teams for Linux detects the "meeting started" toast but only
 publishes it over MQTT. When mosquitto is installed, each profile's config.json points
@@ -82,27 +87,44 @@ def base_icon():
 
 # ---- client list -----------------------------------------------------------
 
-def load():
+def read_conf():
     try:
         with open(CONF) as f:
-            clients = json.load(f)["clients"]
+            return json.load(f)
     except FileNotFoundError:
-        return []
+        return {"clients": []}
+
+
+def write_conf(conf):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump(conf, f, indent=2)
+
+
+def signin_check_enabled():
+    """Signed-out detection needs an unauthenticated debugging port per client, so it is opt-in."""
+    return bool(read_conf().get("signin_check", False))
+
+
+def load():
+    conf = read_conf()
+    clients = conf["clients"]
+    if not conf.get("signin_check"):
+        return clients
     used = {c.get("port") for c in clients}
     missing = [c for c in clients if not c.get("port")]
     for c in missing:
         c["port"] = next(p for p in range(PORT_BASE, PORT_BASE + 1000) if p not in used)
         used.add(c["port"])
     if missing:
-        with open(CONF, "w") as f:
-            json.dump({"clients": clients}, f, indent=2)
+        write_conf(conf)
     return clients
 
 
 def save(clients):
-    os.makedirs(os.path.dirname(CONF), exist_ok=True)
-    with open(CONF, "w") as f:
-        json.dump({"clients": clients}, f, indent=2)
+    conf = read_conf()
+    conf["clients"] = clients
+    write_conf(conf)
     for i, c in enumerate(clients):
         write_desktop(i, c)
     sync_tray(clients)
@@ -441,6 +463,8 @@ def signin_needed(st):
     Notifies once per sign-out (grouped), and a client that briefly leaves the sign-in page is
     remembered for SIGNIN_FORGET seconds so it does not notify again. State lives in SIGNIN_STATE;
     the lock keeps overlapping `status` polls from notifying twice."""
+    if not signin_check_enabled():
+        return {}
     import fcntl
     with open(SIGNIN_STATE + ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -568,7 +592,8 @@ def launch(c, minimized=False, extra=()):
     c = next((x for x in load() if x["slug"] == c["slug"]), c)  # picks up the assigned port
     args = [BIN, "--gtk-version=3", f"--class={wm_class(c)}", f"--user-data-dir={profile_dir(c)}",
             f"--appTitle=Teams - {c['name']}"]
-    if c.get("port"):
+    if c.get("port") and signin_check_enabled():
+        # Opt-in only: this port has no authentication (see signin-check in the help text).
         args += [f"--remote-debugging-port={c['port']}", "--remote-debugging-address=127.0.0.1"]
     if os.path.exists(icon_path(c)):
         args.append(f"--appIcon={icon_path(c)}")
@@ -787,6 +812,26 @@ def main():
         remove(clients, i, delete_data=r.returncode == 1)
     elif cmd == "meeting-watch":
         meeting_watch()
+    elif cmd == "signin-check":
+        conf = read_conf()
+        if not args:
+            print("signin-check is", "on" if conf.get("signin_check") else "off")
+            return
+        if args[0] not in ("on", "off"):
+            sys.exit("usage: teams-client signin-check [on|off]")
+        on = args[0] == "on"
+        if on and not conf.get("signin_check"):
+            print("WARNING: this starts every client with a Chromium debugging port on 127.0.0.1.\n"
+                  "The port has no authentication: any process on this computer, as any user, can\n"
+                  "connect and read or control the signed-in Teams session, including its cookies\n"
+                  "and tokens. Only switch it on if you trust everything that runs here.")
+        conf["signin_check"] = on
+        write_conf(conf)
+        if not on and os.path.exists(SIGNIN_STATE):
+            os.remove(SIGNIN_STATE)
+        load()  # assigns ports when switched on
+        print(f"signin-check {'on' if on else 'off'}. Restart the clients to apply "
+              "(teams-client quit-all, then teams-client start-all).")
     elif cmd == "sync":
         save(clients)
     else:
