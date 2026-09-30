@@ -418,7 +418,7 @@ def on_signin_page(c):
 
 def notify_signin(cs):
     """One notification for every client that just got signed out; clicking opens the first."""
-    script = ('r=$(notify-send -a "Microsoft Teams" -i "$1" --action=open="Sign in" "$2" "$3"); '
+    script = ('r=$(notify-send -a "Microsoft Teams" -h boolean:resident:true -i "$1" --action=open="Sign in" "$2" "$3"); '
               '[ "$r" = open ] && exec "$4" focus "$5"')
     names = ", ".join(c["name"] for c in cs)
     body = ("Signed out. Click to sign in again." if len(cs) == 1 else
@@ -429,7 +429,7 @@ def notify_signin(cs):
 
 
 def notify_meeting(c):
-    script = ('r=$(notify-send -a "Microsoft Teams" -u critical -i "$1" --action=open="Open Teams" "$2" "$3"); '
+    script = ('r=$(notify-send -a "Microsoft Teams" -u critical -h boolean:resident:true -i "$1" --action=open="Open Teams" "$2" "$3"); '
               '[ "$r" = open ] && exec "$4" focus "$5"')
     subprocess.Popen(["sh", "-c", script, "_", icon_path(c), f"Teams – {c['name']}", "A meeting has started.",
                       SELF, c["slug"]],
