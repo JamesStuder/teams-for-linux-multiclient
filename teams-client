@@ -590,17 +590,17 @@ def write_app_config(c):
 
 def launch(c, minimized=False, extra=()):
     c = next((x for x in load() if x["slug"] == c["slug"]), c)  # picks up the assigned port
-    args = [BIN, "--gtk-version=3", f"--class={wm_class(c)}", f"--user-data-dir={profile_dir(c)}",
-            f"--appTitle=Teams - {c['name']}"]
+    args = [BIN, "--gtk-version=3", f"--window.class={wm_class(c)}", f"--user-data-dir={profile_dir(c)}",
+            f"--app.title=Teams - {c['name']}"]
     if c.get("port") and signin_check_enabled():
         # Opt-in only: this port has no authentication (see signin-check in the help text).
         args += [f"--remote-debugging-port={c['port']}", "--remote-debugging-address=127.0.0.1"]
     if os.path.exists(icon_path(c)):
-        args.append(f"--appIcon={icon_path(c)}")
+        args.append(f"--tray.icon={icon_path(c)}")
     if c.get("url"):
-        args.append(f"--url={c['url']}")
+        args.append(f"--app.url={c['url']}")
     if minimized:
-        args.append("--minimized")
+        args.append("--window.minimized")
     args += list(extra)
     os.makedirs(profile_dir(c), exist_ok=True)
     write_app_config(c)
